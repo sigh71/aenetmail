@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Collections.Specialized;
 using System.Linq;
 using System.Security.Cryptography;
 using System.Text;
@@ -19,8 +20,8 @@ namespace AE.Net.Mail {
 
     private string _FetchHeaders = null;
 
-    public ImapClient(string host, string username, string password, AuthMethods method = AuthMethods.Login, int port = 143, bool secure = false) {
-      Connect(host, port, secure);
+    public ImapClient(string host, string username, string password, AuthMethods method = AuthMethods.Login, int port = 143, bool secure = false, bool skipSslValidation = false) {
+      Connect(host, port, secure, skipSslValidation);
       AuthMethod = method;
       Login(username, password);
     }
@@ -177,18 +178,27 @@ namespace AE.Net.Mail {
       }
     }
 
-    public void AppendMail(string mailbox, MailMessage email) {
+    public void AppendMail(MailMessage email, string mailbox = null) {
       IdlePause();
 
       string flags = String.Empty;
-      string size = (email.Body.Length - 1).ToString();
+      var body = new StringBuilder();
+      using (var txt = new System.IO.StringWriter(body))
+        email.Save(txt);
+
+      string size = body.Length.ToString();
       if (email.RawFlags.Length > 0) {
-        flags = string.Concat("(", string.Join(" ", email.Flags), ")");
+        flags = " (" + string.Join(" ", email.Flags) + ")";
       }
-      string command = GetTag() + "APPEND " + mailbox.QuoteString() + " " + flags + " {" + size + "}";
+
+      if (mailbox == null)
+        CheckMailboxSelected();
+      mailbox = mailbox ?? _SelectedMailbox;
+
+      string command = GetTag() + "APPEND " + (mailbox ?? _SelectedMailbox).QuoteString() + flags + " {" + size + "}";
       string response = SendCommandGetResponse(command);
       if (response.StartsWith("+")) {
-        response = SendCommandGetResponse(email.Body);
+        response = SendCommandGetResponse(body.ToString());
       }
       IdleResume();
     }
@@ -205,8 +215,6 @@ namespace AE.Net.Mail {
       var tag = GetTag();
       var response = SendCommandGetResponse(tag + "NOOP");
       while (!response.StartsWith(tag)) {
-        //if (_IdleEvents != null && _IdleQueue != null)    //NK: I'm not sure how to deal with this... Add to the _Responses queue?
-        //    _IdleQueue.Enqueue(response);
         response = GetResponse();
       }
 
@@ -342,60 +350,93 @@ namespace AE.Net.Mail {
       return GetMessages((startIndex + 1).ToString(), (endIndex + 1).ToString(), false, headersonly, setseen);
     }
 
-    private static Regex rxGetBodyLength = new Regex(@"\* \d+ FETCH.*?BODY.*?\{(\d+)\}", RegexOptions.Compiled);
-    private static Regex rxUID = new Regex(@"UID (\d+)", RegexOptions.Compiled);
-    private static Regex rxFlags = new Regex(@"FLAGS \((.*?)\)", RegexOptions.Compiled);
-    private static Regex rxSize = new Regex(@"RFC822\.SIZE (\d+)", RegexOptions.Compiled);
+    internal static NameValueCollection ParseImapHeader(string data) {
+      var values = new NameValueCollection();
+      string name = null;
+      int nump = 0;
+      var temp = new StringBuilder();
+      if (data != null)
+        foreach (var c in data) {
+          if (c == ' ') {
+            if (name == null) {
+              name = temp.ToString();
+              temp.Clear();
+
+            } else if (nump == 0) {
+              values[name] = temp.ToString();
+              name = null;
+              temp.Clear();
+            } else
+              temp.Append(c);
+          } else if (c == '(') {
+            if (nump > 0)
+              temp.Append(c);
+            nump++;
+          } else if (c == ')') {
+            nump--;
+            if (nump > 0)
+              temp.Append(c);
+          } else
+            temp.Append(c);
+        }
+
+      if (name != null)
+        values[name] = temp.ToString();
+
+      return values;
+    }
 
     public MailMessage[] GetMessages(string start, string end, bool uid, bool headersonly, bool setseen) {
       CheckMailboxSelected();
       IdlePause();
 
-      string UID, HEADERS, SETSEEN;
-      UID = HEADERS = SETSEEN = String.Empty;
-      if (uid)
-        UID = "UID ";
-      if (headersonly)
-        HEADERS = "HEADER";
-      if (!setseen)
-        SETSEEN = ".PEEK";
       string tag = GetTag();
-      string command = tag + UID + "FETCH " + start + ":" + end + " (" + _FetchHeaders + "UID RFC822.SIZE FLAGS BODY" + SETSEEN + "[" + HEADERS + "]"+ ")";
+      string command = tag + (uid ? "UID " : null)
+        + "FETCH " + start + ":" + end + " ("
+        + _FetchHeaders + "UID FLAGS BODY"
+        + (setseen ? ".PEEK" : null)
+        + "[" + (headersonly ? "HEADER" : null) + "])";
+
       string response;
       var x = new List<MailMessage>();
 
       SendCommand(command);
       while (true) {
         response = GetResponse();
-        if (response.Contains(tag + "OK"))
+        if (string.IsNullOrEmpty(response) || response.Contains(tag + "OK"))
           break;
 
-        var m = rxGetBodyLength.Match(response);
-        if (!m.Success)
+        if (response[0] != '*' || !response.Contains("FETCH ("))
           continue;
 
-        int length = m.Groups[1].Value.ToInt();
         var mail = new MailMessage();
+        var imapHeaders = ParseImapHeader(response.Substring(response.IndexOf('(') + 1));
+        mail.Size = (imapHeaders["BODY[HEADER]"] ?? imapHeaders["BODY[]"]).Trim('{', '}').ToInt();
+
+        if (imapHeaders["UID"] != null)
+          mail.Uid = imapHeaders["UID"];
+
+        if (imapHeaders["Flags"] != null)
+          mail.SetFlags(imapHeaders["Flags"]);
+
+
+        foreach (var key in imapHeaders.AllKeys.Except(new[] { "UID", "Flags", "BODY[]", "BODY[HEADER]" }, StringComparer.OrdinalIgnoreCase))
+          mail.Headers.Add(key, new HeaderValue(imapHeaders[key]));
+
         var body = new StringBuilder();
-        var buffer = new char[8192];
+        int remaining = mail.Size;
+        var buffer = new byte[8192];
         int read;
-        while (length > 0) {
-          read = _Reader.Read(buffer, 0, Math.Min(length, buffer.Length));
-          body.Append(buffer, 0, read);
-          length -= read;
+        while (remaining > 0) {
+          read = _Stream.Read(buffer, 0, Math.Min(remaining, buffer.Length));
+          body.Append(System.Text.Encoding.UTF8.GetString(buffer, 0, read));
+          remaining -= read;
         }
 
-        mail.Load(body.ToString(), headersonly);
+        var next = Convert.ToChar(_Stream.ReadByte());
+        System.Diagnostics.Debug.Assert(next == ')');
 
-        var m2 = rxUID.Match(response);
-        if (m2.Groups[1] != null)
-          mail.Uid = m2.Groups[1].ToString();
-        m2 = rxFlags.Match(response);
-        if (m2.Groups[1] != null)
-          mail.SetFlags(m2.Groups[1].ToString());
-        m2 = rxSize.Match(response);
-        if (m2.Groups[1] != null)
-          mail.Size = m2.Groups[1].Value.ToInt();
+        mail.Load(body.ToString(), headersonly);
 
         x.Add(mail);
       }
@@ -480,7 +521,7 @@ namespace AE.Net.Mail {
           key = result.Replace("+ ", "");
           key = System.Text.Encoding.Default.GetString(Convert.FromBase64String(key));
           // calcul hash
-          using (HMACMD5 kMd5 = new HMACMD5(System.Text.Encoding.ASCII.GetBytes(password))) {
+          using (var kMd5 = new HMACMD5(System.Text.Encoding.ASCII.GetBytes(password))) {
             byte[] hash1 = kMd5.ComputeHash(System.Text.Encoding.ASCII.GetBytes(key));
             key = BitConverter.ToString(hash1).ToLower().Replace("-", "");
             result = Convert.ToBase64String(System.Text.Encoding.ASCII.GetBytes(login + " " + key));
@@ -506,11 +547,12 @@ namespace AE.Net.Mail {
         throw new Exception(result);
       }
 
-      if (Supports("COMPRESS=DEFLATE")) {
-        //SendCommandCheckOK(GetTag() + "compress deflate");
-        //_Reader = new System.IO.StreamReader(new System.IO.Compression.DeflateStream(_Stream, System.IO.Compression.CompressionMode.Decompress));
-        //_Writer = new System.IO.StreamWriter(new System.IO.Compression.DeflateStream(_Stream, System.IO.Compression.CompressionMode.Compress));
-      }
+      //if (Supports("COMPRESS=DEFLATE")) {
+      //  SendCommandCheckOK(GetTag() + "compress deflate");
+      //  _Stream0 = _Stream;
+      // // _Reader = new System.IO.StreamReader(new System.IO.Compression.DeflateStream(_Stream0, System.IO.Compression.CompressionMode.Decompress, true), System.Text.Encoding.Default);
+      // // _Stream = new System.IO.Compression.DeflateStream(_Stream0, System.IO.Compression.CompressionMode.Compress, true);
+      //}
 
       if (Supports("X-GM-EXT-1")) {
         _FetchHeaders = "X-GM-MSGID X-GM-THRID X-GM-LABELS ";
@@ -518,7 +560,8 @@ namespace AE.Net.Mail {
     }
 
     internal override void OnLogout() {
-      SendCommand(GetTag() + "LOGOUT");
+      if (IsConnected)
+        SendCommand(GetTag() + "LOGOUT");
     }
 
     public Namespaces Namespace() {

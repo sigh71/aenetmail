@@ -82,18 +82,29 @@ namespace AE.Net.Mail {
       return chr == ' ' || chr == '\t' || chr == '\n' || chr == '\r';
     }
 
+    private static Regex rxNewLines = new Regex(@"\=[\r\n]+", RegexOptions.Singleline | RegexOptions.Compiled);
+    private static Regex rxEscaped = new Regex(@"(\=[0-9A-F]{2}){1,2}", RegexOptions.Compiled);
     internal static string DecodeQuotedPrintable(string value, Encoding encoding = null) {
       if (encoding == null) {
         encoding = System.Text.Encoding.UTF8;
       }
 
-      value = Regex.Replace(value, @"\=[\r\n]+", string.Empty, RegexOptions.Singleline);
-      var matches = Regex.Matches(value, @"\=[0-9A-F]{2}");
+      if (value.IndexOf('_') > -1 && value.IndexOf(' ') == -1)
+        value = value.Replace('_', ' ');
+
+      value = rxNewLines.Replace(value, string.Empty);
+      var matches = rxEscaped.Matches(value);
       foreach (var match in matches.Cast<Match>().Reverse()) {
-        int ascii = int.Parse(match.Value.Substring(1), System.Globalization.NumberStyles.HexNumber);
+
+        int ascii;
+        try {
+          ascii = int.Parse(match.Value.Replace("=", string.Empty), System.Globalization.NumberStyles.HexNumber);
+        } catch (Exception ex) {
+          throw new Exception("Failed parsing \"" + match.Value + "\" as an integer", ex);
+        }
 
         //http://stackoverflow.com/questions/1318933/c-sharp-int-to-byte
-        byte[] result = BitConverter.GetBytes(ascii);
+        var result = BitConverter.GetBytes(ascii);
         if (BitConverter.IsLittleEndian)
           Array.Reverse(result);
 
@@ -101,6 +112,7 @@ namespace AE.Net.Mail {
          + encoding.GetString(result).Trim('\0')
          + value.Substring(match.Index + match.Length);
       }
+
       return value;
     }
 

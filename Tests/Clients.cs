@@ -82,6 +82,9 @@ namespace Tests {
           msg.Subject.Should().Not.Be.NullOrEmpty();
           msg = mail.GetMessage(0, false);
           msg.Body.Should().Not.Be.NullOrEmpty();
+
+          mail.Disconnect();
+          mail.Disconnect();
         }
     }
 
@@ -120,12 +123,51 @@ namespace Tests {
     }
 
     [TestMethod]
+    public void TestIssue49() {
+      using (var client = GetClient<ImapClient>()) {
+        var msg = client.SearchMessages(SearchCondition.Subject("aenetmail").And(SearchCondition.Subject("#49"))).Select(x => x.Value).FirstOrDefault();
+        msg.Should().Not.Be.Null();
+        msg.AlternateViews.FirstOrDefault(x=>x.ContentType.Contains("html")).Body.Should().Not.Be.Null();
+      }
+    }
+
+    [TestMethod]
+    public void TestAppendMail() {
+      using (var client = GetClient<ImapClient>()) {
+        var msg = new MailMessage {
+          Subject = "TEST",
+          Body = "Appended!"
+        };
+        msg.Date = DateTime.Now;
+
+        client.AppendMail(msg, "Inbox");
+      }
+    }
+
+    [TestMethod]
+    public void TestParseImapHeader() {
+      var header = @"X-GM-THRID 1320777376118077475 X-GM-MSGID 1320777376118077475 X-GM-LABELS () UID 8286 RFC822.SIZE 9369 FLAGS (\Seen) BODY[] {9369}";
+
+      var values = ImapClient.ParseImapHeader(header);
+      values["FLAGS"].Should().Equal(@"\Seen");
+      values["UID"].Should().Equal("8286");
+      values["X-GM-MSGID"].Should().Equal("1320777376118077475");
+      values["X-GM-LABELS"].Should().Be.NullOrEmpty();
+      values["RFC822.SIZE"].Should().Equal("9369");
+    }
+
+    [TestMethod]
     public void TestGetSeveralMessages() {
+      int numMessages = 1000;
       using (var imap = GetClient<ImapClient>()) {
-        var msgs = imap.GetMessages(0, 9);
-        msgs.Length.Should().Equal(10);
+        var msgs = imap.GetMessages(0, numMessages - 1, true);
+        msgs.Length.Should().Equal(numMessages);
         msgs.Count(x => string.IsNullOrEmpty(x.Subject)).Should().Equal(0);
-        msgs.GroupBy(x => x.Subject).Count().Should().Equal(10);
+      }
+      using (var imap = GetClient<ImapClient>()) {
+        var msgs = imap.GetMessages(0, numMessages - 1, false);
+        msgs.Length.Should().Equal(numMessages);
+        msgs.Count(x => string.IsNullOrEmpty(x.Subject)).Should().Equal(0);
       }
     }
 
